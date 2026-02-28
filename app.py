@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 
 from flask import Flask, request, jsonify, g, send_from_directory, abort
+from flask_cors import CORS  # Добавляем CORS
 import asyncio
 from telegram import Bot
 from telegram.error import TelegramError, Forbidden, BadRequest
@@ -64,10 +65,21 @@ def weighted_choice(items, weights):
             return item
     return items[-1]
 
-# Инициализация бота (для новой версии)
+# Инициализация бота
 bot = Bot(token=BOT_TOKEN)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
+
+# ==== НАСТРОЙКА CORS ====
+# Разрешаем запросы с любых доменов (для разработки)
+# В продакшене лучше указать конкретные домены
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"]
+    }
+})
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'app.db')
 
@@ -179,7 +191,6 @@ def start_of_day(dt):
 # Асинхронная обертка для проверки подписки
 def user_subscribed(user_id: int) -> bool:
     try:
-        # Создаем новый event loop для синхронного вызова
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -499,8 +510,12 @@ def index():
 def admin_page():
     return send_from_directory(app.static_folder, 'admin.html')
 
-@app.route('/api/check-subscribe', methods=['POST'])
+@app.route('/api/check-subscribe', methods=['POST', 'OPTIONS'])
 def check_subscribe():
+    # OPTIONS запросы автоматически обрабатываются Flask-CORS
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
@@ -510,8 +525,11 @@ def check_subscribe():
     user_id = int(data.get('user_id'))
     return jsonify({'subscribed': user_subscribed(user_id)})
 
-@app.route('/api/status', methods=['POST'])
+@app.route('/api/status', methods=['POST', 'OPTIONS'])
 def status():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
@@ -521,8 +539,11 @@ def status():
     user_id = int(data.get('user_id'))
     return jsonify(get_status_for(user_id))
 
-@app.route('/api/spin', methods=['POST'])
+@app.route('/api/spin', methods=['POST', 'OPTIONS'])
 def spin():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
@@ -583,8 +604,11 @@ def spin():
 
     return jsonify({'prize': prize, 'spin_id': spin_id})
 
-@app.route('/api/submit-lead', methods=['POST'])
+@app.route('/api/submit-lead', methods=['POST', 'OPTIONS'])
 def submit_lead():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
@@ -641,8 +665,11 @@ def submit_lead():
 
     return jsonify({'ok': True})
 
-@app.route('/api/lead-fallback', methods=['POST'])
+@app.route('/api/lead-fallback', methods=['POST', 'OPTIONS'])
 def lead_fallback():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
@@ -684,8 +711,11 @@ def lead_fallback():
 
     return jsonify({'ok': True})
 
-@app.route('/api/process-fallbacks', methods=['POST', 'GET'])
+@app.route('/api/process-fallbacks', methods=['POST', 'GET', 'OPTIONS'])
 def process_fallbacks_endpoint():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         c1 = process_pending_fallbacks(limit=300)
         c2 = process_due_fallbacks(limit=200, grace_seconds=FALLBACK_TTL_SECONDS)
@@ -693,8 +723,20 @@ def process_fallbacks_endpoint():
     except Exception as e:
         return jsonify({'error': repr(e)}), 500
 
-# Остальные роуты админки (admin/recipients, admin/send-chunk, admin/broadcast-create и т.д.)
-# ... (они остаются без изменений, просто замените в них bot.send_message на send_telegram_message)
+@app.route('/api/wheel-config', methods=['GET', 'OPTIONS'])
+def get_wheel_config():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    conf = load_wheel_from_db()
+    if conf:
+        items = [{'label': c[0], 'weight': int(c[1]), 'win_text': c[2]} for c in conf]
+    else:
+        items = [{'label': l, 'weight': w, 'win_text': ''} for l, w in zip(PRIZES, PRIZE_WEIGHTS)]
+    return jsonify({'items': items})
+
+# Добавьте OPTIONS обработку для всех остальных API роутов админки
+# ...
 
 @app.route('/health')
 def health():
