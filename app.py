@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from html import escape
 
-from flask import Flask, request, jsonify, g, send_from_directory, abort
+from flask import Flask, request, jsonify, g, send_from_directory, abort, make_response
 from flask_cors import CORS  # Добавляем CORS
 import asyncio
 from telegram import Bot
@@ -19,7 +19,7 @@ SUBSCRIPTION_CHANNEL_ID = os.environ.get('SUBSCRIPTION_CHANNEL_ID', '-1001698393
 LEADS_TARGET_ID         = os.environ.get('LEADS_TARGET_ID', '-1003413060996')
 BOT_USERNAME = os.environ.get('BOT_USERNAME', 'BODYFACEROOMbot').strip('@')
 
-# Админы (главный + доп.админы для админки)
+# Админы
 _admin_env = os.environ.get(
     'ADMIN_USER_IDS',
     '291655689,463942971,5230371449'
@@ -36,7 +36,7 @@ REFERRAL_BONUS        = int(os.environ.get('REFERRAL_BONUS', '1'))
 SWEEP_INTERVAL_SECONDS = int(os.environ.get('SWEEP_INTERVAL_SECONDS', '60'))
 FALLBACK_TTL_SECONDS   = int(os.environ.get('FALLBACK_TTL_SECONDS', '120'))
 
-# ==== БАЗОВЫЕ ПРИЗЫ BODYFACEROOM ====
+# ==== БАЗОВЫЕ ПРИЗЫ ====
 PRIZES = [
     'Годовой абонемент на лазерную эпиляцию (подмышки)',
     'Сертификат на 15 000 ₽ на любые услуги',
@@ -70,16 +70,61 @@ bot = Bot(token=BOT_TOKEN)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 
-# ==== НАСТРОЙКА CORS ====
-# Разрешаем запросы с любых доменов (для разработки)
-# В продакшене лучше указать конкретные домены
+# ==== НАСТРОЙКА CORS (УЛУЧШЕННАЯ) ====
+# Разрешаем все необходимые домены
 CORS(app, resources={
     r"/api/*": {
-        "origins": "*",
+        "origins": [
+            "https://neyrolab.ru",
+            "http://neyrolab.ru",
+            "https://www.neyrolab.ru",
+            "http://www.neyrolab.ru",
+            "https://web.telegram.org",
+            "https://t.me",
+            "http://localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:3000",
+            "*"  # временно разрешаем все для теста
+        ],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"]
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+        "expose_headers": ["Content-Type", "X-Requested-With"],
+        "supports_credentials": True,
+        "max_age": 3600
     }
 })
+
+# Добавляем middleware для принудительной установки CORS-заголовков
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
+
+# Обработчик OPTIONS запросов для всех маршрутов
+@app.route('/api/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    response = make_response()
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Max-Age', '3600')
+    return response
+
+# Явный обработчик OPTIONS для корневого api
+@app.route('/api/<path:path>', methods=['OPTIONS'])
+def handle_all_options(path):
+    response = make_response()
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Max-Age', '3600')
+    return response
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'app.db')
 
@@ -124,7 +169,7 @@ def ensure_schema():
     CREATE TABLE IF NOT EXISTS lead_events (
       spin_id   INTEGER PRIMARY KEY,
       user_id   INTEGER NOT NULL,
-      type      TEXT NOT NULL,  -- 'full' or 'fallback'
+      type      TEXT NOT NULL,
       ts        TIMESTAMP NOT NULL
     );
     CREATE TABLE IF NOT EXISTS audience (
@@ -132,7 +177,6 @@ def ensure_schema():
       username  TEXT,
       added_at  TIMESTAMP NOT NULL
     );
-
     CREATE TABLE IF NOT EXISTS wheel_items (
       id       INTEGER PRIMARY KEY,
       pos      INTEGER NOT NULL,
@@ -140,7 +184,6 @@ def ensure_schema():
       win_text TEXT,
       weight   INTEGER NOT NULL DEFAULT 0
     );
-
     CREATE TABLE IF NOT EXISTS pending_fallbacks (
       spin_id    INTEGER PRIMARY KEY,
       user_id    INTEGER NOT NULL,
@@ -148,9 +191,8 @@ def ensure_schema():
       username   TEXT,
       created_ts TIMESTAMP NOT NULL,
       due_ts     TIMESTAMP NOT NULL,
-      state      TEXT NOT NULL DEFAULT 'pending'  -- pending|sent|full
+      state      TEXT NOT NULL DEFAULT 'pending'
     );
-
     CREATE TABLE IF NOT EXISTS broadcast_jobs (
       id               INTEGER PRIMARY KEY,
       created_at       TIMESTAMP NOT NULL,
@@ -185,10 +227,6 @@ with app.app_context():
 def utcnow():
     return datetime.now(tz=TZ)
 
-def start_of_day(dt):
-    return datetime(dt.year, dt.month, dt.day, tzinfo=TZ)
-
-# Асинхронная обертка для проверки подписки
 def user_subscribed(user_id: int) -> bool:
     try:
         loop = asyncio.new_event_loop()
@@ -208,23 +246,18 @@ def build_ref_link(user_id: int) -> str:
 
 def get_status_for(user_id: int):
     db = get_db()
-
     total_spins = db.execute(
         "SELECT COUNT(*) AS cnt FROM spins WHERE user_id=?",
         (user_id,)
     ).fetchone()['cnt']
-
     total_referrals = db.execute(
         "SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_id=?",
         (user_id,)
     ).fetchone()['cnt']
-
     base_attempts = BASE_ATTEMPTS_PER_DAY
     attempts_granted = base_attempts + REFERRAL_BONUS * total_referrals
-
     attempts_left = max(0, attempts_granted - total_spins)
     ref_link = build_ref_link(user_id)
-
     return {
         'attempts_left': attempts_left,
         'bonus': total_referrals,
@@ -239,7 +272,7 @@ def load_wheel_from_db():
         return None
     return [(r['label'], int(r['weight'] or 0), r['win_text'] or '') for r in rows]
 
-# Асинхронная обертка для отправки сообщений
+# Функции для отправки сообщений
 def send_telegram_message(chat_id: int, text: str, parse_mode: str = 'HTML'):
     try:
         loop = asyncio.new_event_loop()
@@ -297,7 +330,6 @@ def process_pending_fallbacks(limit: int = 200) -> int:
     now = utcnow()
     if _last_queue_run_ts and (now - _last_queue_run_ts).total_seconds() < 5:
         return 0
-
     db = get_db()
     rows = db.execute("""
       SELECT spin_id, user_id, prize, COALESCE(username,'') AS username
@@ -306,14 +338,12 @@ def process_pending_fallbacks(limit: int = 200) -> int:
       ORDER BY due_ts ASC
       LIMIT ?
     """, (now, limit)).fetchall()
-
     processed = 0
     for r in rows:
         spin_id = int(r['spin_id'])
         user_id = int(r['user_id'])
         prize   = r['prize'] or '—'
         uname   = (r['username'] or '').lstrip('@')
-
         try:
             cur = db.execute("UPDATE pending_fallbacks SET state='sent' WHERE spin_id=? AND state='pending'", (spin_id,))
             if cur.rowcount != 1:
@@ -326,10 +356,8 @@ def process_pending_fallbacks(limit: int = 200) -> int:
         except Exception as e:
             print('process_pending_fallbacks mark error:', repr(e))
             continue
-
         _send_fallback_message_direct(user_id, spin_id, prize, uname)
         processed += 1
-
     _last_queue_run_ts = now
     return processed
 
@@ -338,7 +366,6 @@ def process_due_fallbacks(limit: int = 200, grace_seconds: int = FALLBACK_TTL_SE
     now = utcnow()
     if _last_fallback_run_ts and (now - _last_fallback_run_ts).total_seconds() < 20:
         return 0
-
     db = get_db()
     due_before = now - timedelta(seconds=grace_seconds)
     rows = db.execute(
@@ -352,36 +379,30 @@ def process_due_fallbacks(limit: int = 200, grace_seconds: int = FALLBACK_TTL_SE
         """,
         (due_before, limit)
     ).fetchall()
-
     processed = 0
     for r in rows:
         spin_id = int(r['spin_id'])
         user_id = int(r['user_id'])
         prize   = r['prize']
-
         try:
             db.execute("INSERT INTO lead_events(spin_id, user_id, type, ts) VALUES (?,?,?,?)",
                        (spin_id, user_id, 'fallback', now))
             db.commit()
         except sqlite3.IntegrityError:
             continue
-
         _send_fallback_message_direct(user_id, spin_id, prize, '')
         processed += 1
-
     _last_fallback_run_ts = now
     return processed
 
 def schedule_spin_fallback(spin_id: int, user_id: int, prize: str, username: str):
     enqueue_fallback(spin_id, user_id, prize, username, delay=FALLBACK_TTL_SECONDS)
-
     def task():
         try:
             with app.app_context():
                 process_pending_fallbacks(limit=50)
         except Exception as e:
             print('schedule_spin_fallback timer error:', repr(e))
-
     t = threading.Timer(FALLBACK_TTL_SECONDS + 5.0, task)
     t.daemon = True
     t.start()
@@ -393,12 +414,10 @@ def process_broadcast_queue(limit_per_cycle: int = 15) -> int:
     ).fetchone()
     if not job:
         return 0
-
     job_id = int(job['id'])
     if job['status'] == 'pending':
         db.execute("UPDATE broadcast_jobs SET status='running' WHERE id=?", (job_id,))
         db.commit()
-
     items = db.execute(
         "SELECT id, user_id FROM broadcast_items WHERE job_id=? AND state='pending' LIMIT ?",
         (job_id, limit_per_cycle)
@@ -412,16 +431,13 @@ def process_broadcast_queue(limit_per_cycle: int = 15) -> int:
             db.execute("UPDATE broadcast_jobs SET status='done' WHERE id=?", (job_id,))
             db.commit()
         return 0
-
     text = job['text'] or ''
     parse_mode = (job['parse_mode'] or 'HTML') or None
     if parse_mode not in ('HTML', 'Markdown'):
         parse_mode = None
     attach_ref = bool(job['attach_ref'])
     photo_name = (job['photo_name'] or '').strip()
-
     sent = skipped = errors = 0
-
     for row in items:
         item_id = int(row['id'])
         user_id = int(row['user_id'])
@@ -465,7 +481,6 @@ def process_broadcast_queue(limit_per_cycle: int = 15) -> int:
             )
             errors += 1
         time.sleep(0.1)
-
     db.execute(
         """UPDATE broadcast_jobs
            SET sent_count    = sent_count    + ?,
@@ -475,7 +490,6 @@ def process_broadcast_queue(limit_per_cycle: int = 15) -> int:
         (sent, skipped, errors, job_id)
     )
     db.commit()
-
     pending_left = db.execute(
         "SELECT COUNT(*) AS cnt FROM broadcast_items WHERE job_id=? AND state='pending'",
         (job_id,)
@@ -483,7 +497,6 @@ def process_broadcast_queue(limit_per_cycle: int = 15) -> int:
     if pending_left == 0:
         db.execute("UPDATE broadcast_jobs SET status='done' WHERE id=?", (job_id,))
         db.commit()
-
     return sent + skipped + errors
 
 def is_admin(uid: int) -> bool:
@@ -512,10 +525,12 @@ def admin_page():
 
 @app.route('/api/check-subscribe', methods=['POST', 'OPTIONS'])
 def check_subscribe():
-    # OPTIONS запросы автоматически обрабатываются Flask-CORS
     if request.method == 'OPTIONS':
-        return '', 200
-        
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
@@ -528,8 +543,11 @@ def check_subscribe():
 @app.route('/api/status', methods=['POST', 'OPTIONS'])
 def status():
     if request.method == 'OPTIONS':
-        return '', 200
-        
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
@@ -542,20 +560,21 @@ def status():
 @app.route('/api/spin', methods=['POST', 'OPTIONS'])
 def spin():
     if request.method == 'OPTIONS':
-        return '', 200
-        
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
     except Exception as e:
         print('process fallbacks on spin error:', repr(e))
-
     data = request.get_json(force=True)
     user_id     = int(data['user_id'])
     username    = (data.get('username') or '').strip().lstrip('@')
     referrer_id = data.get('referrer_id')
     referrer_id = int(referrer_id) if referrer_id is not None else None
-
     if username:
         dbu = get_db()
         nowu = utcnow()
@@ -568,14 +587,11 @@ def spin():
             dbu.commit()
         except Exception:
             pass
-
     st = get_status_for(user_id)
     if st['attempts_left'] <= 0:
         return jsonify({'error': 'Попыток больше нет.'}), 400
-
     now = utcnow()
     db = get_db()
-
     conf = load_wheel_from_db()
     if conf:
         items = [c[0] for c in conf]
@@ -583,15 +599,11 @@ def spin():
     else:
         items = PRIZES[:]
         weights = PRIZE_WEIGHTS[:]
-
     prize = weighted_choice(items, weights)
-
     cur = db.execute("INSERT INTO spins(user_id, ts, prize) VALUES (?,?,?)", (user_id, now, prize))
     spin_id = cur.lastrowid
     db.commit()
-
     schedule_spin_fallback(spin_id, user_id, prize, username)
-
     if referrer_id and referrer_id != user_id:
         try:
             db.execute(
@@ -601,29 +613,28 @@ def spin():
             db.commit()
         except sqlite3.IntegrityError:
             pass
-
     return jsonify({'prize': prize, 'spin_id': spin_id})
 
 @app.route('/api/submit-lead', methods=['POST', 'OPTIONS'])
 def submit_lead():
     if request.method == 'OPTIONS':
-        return '', 200
-        
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
     except Exception as e:
         print('process fallbacks on submit-lead error:', repr(e))
-
     data = request.get_json(force=True)
     user_id   = int(data['user_id'])
     spin_id   = int(data['spin_id'])
     name      = (data.get('name') or '').strip()
     phone     = (data.get('phone') or '').strip()
     username  = (data.get('username') or '').strip().lstrip('@')
-
     db = get_db()
-
     if username:
         nowu = utcnow()
         try:
@@ -635,11 +646,9 @@ def submit_lead():
             db.commit()
         except Exception:
             pass
-
     row = db.execute("SELECT prize FROM spins WHERE id=? AND user_id=?", (spin_id, user_id)).fetchone()
     prize = row['prize'] if row and row['prize'] else '—'
     now = utcnow()
-
     db.execute(
         "INSERT INTO leads(user_id, username, name, phone, ts) VALUES (?,?,?,?,?) "
         "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, name=excluded.name, phone=excluded.phone, ts=excluded.ts",
@@ -651,7 +660,6 @@ def submit_lead():
                    (spin_id, user_id, 'full', now))
     db.execute("UPDATE pending_fallbacks SET state='full' WHERE spin_id=?", (spin_id,))
     db.commit()
-
     text = (
         f"<b>📥 Лид (полный)</b>\n"
         f"SpinID: <code>{spin_id}</code>\n"
@@ -662,42 +670,39 @@ def submit_lead():
         f"Результат: {escape(prize)}"
     )
     send_telegram_message(chat_id=LEADS_TARGET_ID, text=text, parse_mode='HTML')
-
     return jsonify({'ok': True})
 
 @app.route('/api/lead-fallback', methods=['POST', 'OPTIONS'])
 def lead_fallback():
     if request.method == 'OPTIONS':
-        return '', 200
-        
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
     try:
         process_pending_fallbacks()
         process_due_fallbacks()
     except Exception as e:
         print('process fallbacks on lead-fallback error:', repr(e))
-
     data = request.get_json(force=True)
     user_id  = int(data['user_id'])
     spin_id  = int(data['spin_id'])
     username = (data.get('username') or '').strip().lstrip('@')
     name     = (data.get('name') or '').strip()
-
     db = get_db()
     ev = db.execute("SELECT type FROM lead_events WHERE spin_id=?", (spin_id,)).fetchone()
     if ev and ev['type'] == 'full':
         return jsonify({'ok': True, 'skipped': True})
-
     cur = db.execute("UPDATE pending_fallbacks SET state='sent' WHERE spin_id=? AND state='pending'", (spin_id,))
     now = utcnow()
     row = db.execute("SELECT prize FROM spins WHERE id=? AND user_id=?", (spin_id, user_id)).fetchone()
     prize = row['prize'] if row and row['prize'] else '—'
-
     existed = db.execute("SELECT 1 FROM lead_events WHERE spin_id=?", (spin_id,)).fetchone()
     if not existed:
         db.execute("INSERT INTO lead_events(spin_id, user_id, type, ts) VALUES (?,?,?,?)",
                    (spin_id, user_id, 'fallback', now))
     db.commit()
-
     text = (
         f"<b>📥 Лид (без телефона)</b>\n"
         f"SpinID: <code>{spin_id}</code>\n"
@@ -708,14 +713,16 @@ def lead_fallback():
         f"Результат: {escape(prize)}"
     )
     send_telegram_message(chat_id=LEADS_TARGET_ID, text=text, parse_mode='HTML')
-
     return jsonify({'ok': True})
 
 @app.route('/api/process-fallbacks', methods=['POST', 'GET', 'OPTIONS'])
 def process_fallbacks_endpoint():
     if request.method == 'OPTIONS':
-        return '', 200
-        
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,GET,OPTIONS')
+        return response
     try:
         c1 = process_pending_fallbacks(limit=300)
         c2 = process_due_fallbacks(limit=200, grace_seconds=FALLBACK_TTL_SECONDS)
@@ -726,17 +733,17 @@ def process_fallbacks_endpoint():
 @app.route('/api/wheel-config', methods=['GET', 'OPTIONS'])
 def get_wheel_config():
     if request.method == 'OPTIONS':
-        return '', 200
-        
+        response = make_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,OPTIONS')
+        return response
     conf = load_wheel_from_db()
     if conf:
         items = [{'label': c[0], 'weight': int(c[1]), 'win_text': c[2]} for c in conf]
     else:
         items = [{'label': l, 'weight': w, 'win_text': ''} for l, w in zip(PRIZES, PRIZE_WEIGHTS)]
     return jsonify({'items': items})
-
-# Добавьте OPTIONS обработку для всех остальных API роутов админки
-# ...
 
 @app.route('/health')
 def health():
